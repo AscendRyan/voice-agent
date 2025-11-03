@@ -1,7 +1,6 @@
 // src/tools.ts
 import { google } from "googleapis";
 
-// Simple allowlist check for webhooks
 function isAllowedWebhook(urlStr: string): boolean {
   try {
     const url = new URL(urlStr);
@@ -45,7 +44,6 @@ export async function sendEmailViaGmail(args: SendEmailArgs) {
 
   const gmail = google.gmail({ version: "v1", auth: oauth2Client });
 
-  // Build RFC2822 email
   const messageParts = [
     `From: ${sender}`,
     `To: ${to}`,
@@ -58,7 +56,10 @@ export async function sendEmailViaGmail(args: SendEmailArgs) {
     html ?? text ?? "",
   ];
   const message = messageParts.join("\r\n");
-  const encodedMessage = Buffer.from(message).toString("base64").replace(/\+/g, "-").replace(/\//g, "_");
+  const encodedMessage = Buffer.from(message)
+    .toString("base64")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_");
 
   const res = await gmail.users.messages.send({
     userId: "me",
@@ -67,9 +68,9 @@ export async function sendEmailViaGmail(args: SendEmailArgs) {
 
   return {
     id: res.data.id,
-    labelIds: res.data.labelIds,
     threadId: res.data.threadId,
-    status: "sent",
+    labelIds: res.data.labelIds,
+    status: "sent"
   };
 }
 
@@ -88,11 +89,10 @@ export async function postWebhook(args: PostWebhookArgs) {
     ok: res.ok,
     status: res.status,
     statusText: res.statusText,
-    body: bodyText.slice(0, 2000), // don’t flood logs
+    body: bodyText.slice(0, 2000),
   };
 }
 
-// Realtime tool **schemas** (JSON Schema) that we’ll attach to the session
 export const TOOL_DEFS = [
   {
     type: "function",
