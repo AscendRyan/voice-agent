@@ -1,49 +1,33 @@
 // src/server.ts
-import "dotenv/config";
+import http from "http";
 import express from "express";
-import * as http from "http";
-import { WebSocketServer, WebSocket } from "ws";
-import { ClientMessageSchema } from "./types.js";
+import cors from "cors";
+import WebSocket, { WebSocketServer } from "ws";
 
-const PORT = Number(process.env.PORT || 8787);
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY!;
-const MODEL = process.env.OPENAI_REALTIME_MODEL || "gpt-realtime";
-const VOICE = process.env.VOICE || "alloy";
+const PORT = Number(process.env.PORT || 10000);
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-realtime";
 const OUTPUT_AUDIO_FORMAT = process.env.OUTPUT_AUDIO_FORMAT || "pcm16";
 const INPUT_AUDIO_FORMAT  = process.env.INPUT_AUDIO_FORMAT  || "pcm16";
 
 if (!OPENAI_API_KEY) {
-  console.error("Missing OPENAI_API_KEY in env");
+  console.error("Missing OPENAI_API_KEY env var");
   process.exit(1);
 }
 
 const app = express();
-app.get("/health", (_req, res) => res.status(200).send("ok"));
+app.use(cors());
+app.get("/", (_req, res) => res.send("ok"));
 
 const server = http.createServer(app);
+const wss = new WebSocketServer({ server, path: "/ws/voice" });
 
-// WebSocket endpoint your frontend connects to: wss://<host>/ws/voice
-const wss = new WebSocketServer({ noServer: true });
+wss.on("connection", (client) => {
+  console.log("browser connected");
 
-function checkClientAuth(_req: http.IncomingMessage): boolean {
-  // TODO: add your own auth (cookies/JWT/API token, etc.)
-  return true;
-}
-
-server.on("upgrade", (req, socket, head) => {
-  if (!req.url?.startsWith("/ws/voice") || !checkClientAuth(req)) {
-    socket.destroy();
-    return;
-  }
-  wss.handleUpgrade(req, socket, head, (ws) => {
-    wss.emit("connection", ws, req);
-  });
-});
-
-wss.on("connection", async (client: WebSocket) => {
-  // Connect upstream to OpenAI Realtime API (WebSocket)
+  // 1) Connect to OpenAI Realtime WS (Server ↔ OpenAI)
   const upstream = new WebSocket(
-    `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(MODEL)}`,
+    `wss://api.openai.com/v1/realtime?model=${OPENAI_MODEL}`,
     {
       headers: {
         Authorization: `Bearer ${OPENAI_API_KEY}`,
@@ -52,157 +36,137 @@ wss.on("connection", async (client: WebSocket) => {
     }
   );
 
-  let closed = false;
+  // 2) Queue anything we need to send until upstream is OPEN
+  const OPEN = WebSocket.OPEN;
+  const pending: Array<string | Buffer> = [];
 
-  const closeBoth = (code = 1000, reason = "closing") => {
-    if (closed) return;
-    closed = true;
-    try {
-      upstream.close(code, reason);
-    } catch {}
-    try {
-      client.close(code, reason);
-    } catch {}
-  };
+  function sendUpstream(payload: string | Buffer) {
+    if (upstream.readyState === OPEN) {
+      try {
+        upstream.send(payload);
+      } catch (err) {
+        console.error("upstream send error", err);
+      }
+    } else {
+      pending.push(payload);
+    }
+  }
 
-  // Keep-alive ping to browser client
-  const pingInterval = setInterval(() => {
-    if (client.readyState === WebSocket.OPEN) client.ping();
-  }, 30_000);
-
-  client.on("close", () => {
-    clearInterval(pingInterval);
-    closeBoth();
-  });
-  client.on("error", () => closeBoth(1011, "client error"));
-
-  upstream.on("close", () => closeBoth());
-  upstream.on("error", (err) => {
-    safeSend(client, { type: "error", message: "upstream error", details: String(err) });
-    closeBoth(1011, "upstream error");
-  });
-
-  // When upstream is ready, configure session defaults
   upstream.on("open", () => {
-    // Server-side session config: modalities, server VAD, voice, audio format
+    console.log("upstream open (OpenAI)");
+
+    // Configure the session immediately (force pcm16)
     const sessionUpdate = {
       type: "session.update",
       session: {
-        instructions:
-          "You are a concise, helpful voice assistant. Keep answers short when possible.",
-        modalities: ["audio", "text"],
-        // Server VAD: model detects end-of-speech and auto-creates responses
-        turn_detection: { type: "server_vad", silence_duration_ms: 500 },
-        voice: VOICE,
+        input_audio_format: INPUT_AUDIO_FORMAT,
         output_audio_format: OUTPUT_AUDIO_FORMAT,
+        turn_detection: {
+          type: "server_vad",
+          silence_duration_ms: 400,
+          create_response: true,
+          interrupt_response: true,
+        },
       },
     };
     upstream.send(JSON.stringify(sessionUpdate));
-    safeSend(client, { type: "ready", sessionId: randomId("sess_") });
+
+    // Flush anything received from the browser while connecting
+    while (pending.length) {
+      const item = pending.shift()!;
+      try {
+        upstream.send(item);
+      } catch (e) {
+        console.error("flush send error", e);
+      }
+    }
+
+    // Tell the browser we’re ready
+    try {
+      client.send(
+        JSON.stringify({
+          type: "ready",
+          sessionId: `sess_${Math.random().toString(36).slice(2)}`,
+        })
+      );
+    } catch {}
   });
 
-  // FORWARD: Browser -> OpenAI
+  // Forward every message from OpenAI → Browser (text + audio chunks)
+  upstream.on("message", (data, isBinary) => {
+    try {
+      client.send(data, { binary: isBinary });
+    } catch (e) {
+      console.error("client send error", e);
+    }
+  });
+
+  upstream.on("error", (err) => {
+    console.error("upstream error", err);
+    try { client.close(1011, "upstream error"); } catch {}
+  });
+
+  upstream.on("close", (code, reason) => {
+    console.log("upstream closed", code, reason.toString());
+    try { client.close(code === 1000 ? 1000 : 1011, "upstream closed"); } catch {}
+  });
+
+  // Browser → Server messages (binary = mic audio, text = control JSON)
   client.on("message", (data, isBinary) => {
-    // Binary frames are raw audio (e.g., PCM16/Opus). Convert to base64 and append to input buffer.
     if (isBinary) {
-      const base64 = Buffer.from(data as Buffer).toString("base64");
-      upstream.send(JSON.stringify({ type: "input_audio_buffer.append", audio: base64 }));
+      // Wrap raw PCM16 bytes into OpenAI "append" event (base64)
+      const b64 = Buffer.from(data as Buffer).toString("base64");
+      sendUpstream(JSON.stringify({ type: "input_audio_buffer.append", audio: b64 }));
       return;
     }
 
-    // Text frames are JSON control messages
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse((data as Buffer).toString("utf8"));
-    } catch {
-      safeSend(client, { type: "error", message: "Invalid JSON from client" });
+    // JSON control messages
+    let msg: any;
+    try { msg = JSON.parse(data.toString()); } catch { return; }
+
+    if (msg?.type === "interrupt") {
+      // Cancel the currently speaking response
+      sendUpstream(JSON.stringify({ type: "response.cancel" }));
       return;
     }
 
-    const result = ClientMessageSchema.safeParse(parsed);
-    if (!result.success) {
-      safeSend(client, {
-        type: "error",
-        message: "Invalid message shape",
-        details: result.error.format(),
-      });
+    if (msg?.type === "response.create") {
+      // Enforce pcm16 on replies even if the client forgets
+      msg.response = msg.response || {};
+      msg.response.output_audio_format = OUTPUT_AUDIO_FORMAT;
+      sendUpstream(JSON.stringify(msg));
       return;
     }
 
-    const msg = result.data;
-
-    switch (msg.type) {
-      case "session.init": {
-        if (msg.instructions) {
-          upstream.send(
-            JSON.stringify({
-              type: "session.update",
-              session: { instructions: msg.instructions },
-            })
-          );
-        }
-        break;
-      }
-
-      case "interrupt": {
-        // Stop any ongoing model speech/output
-        upstream.send(JSON.stringify({ type: "response.cancel" }));
-        break;
-      }
-
-      case "commit": {
-        // If you disable server VAD, you can force a commit + (optionally) trigger a response here.
-        upstream.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
-        // upstream.send(JSON.stringify({ type: "response.create" }));
-        break;
-      }
-
-      case "response.create": {
-        // Pass-through with sensible audio defaults
-        const payload = {
-          type: "response.create",
-          response: {
-            modalities: ["audio", "text"],
-            voice: VOICE,
-            output_audio_format: OUTPUT_AUDIO_FORMAT,
-            ...(msg.response ?? {}),
-          },
-        };
-        upstream.send(JSON.stringify(payload));
-        break;
-      }
-
-      case "session.update": {
-        upstream.send(JSON.stringify({ type: "session.update", session: msg.session }));
-        break;
-      }
-
-      default: {
-        // Future-proof: pass other messages through
-        upstream.send(JSON.stringify(msg));
-      }
+    if (msg?.type === "session.update") {
+      // Keep formats safe (pcm16)
+      const safe = {
+        type: "session.update",
+        session: {
+          ...msg.session,
+          input_audio_format: INPUT_AUDIO_FORMAT,
+          output_audio_format: OUTPUT_AUDIO_FORMAT,
+        },
+      };
+      sendUpstream(JSON.stringify(safe));
+      return;
     }
+
+    // Pass through any other events as-is
+    sendUpstream(JSON.stringify(msg));
   });
 
-  // FORWARD: OpenAI -> Browser
-  upstream.on("message", (raw) => {
-    // Realtime emits JSON frames. Audio comes as response.audio.delta chunks (base64 payloads).
-    try {
-      client.send(raw, { binary: false });
-    } catch {
-      // client gone
-    }
+  client.on("close", () => {
+    try { upstream.close(1000, "client left"); } catch {}
+  });
+
+  client.on("error", (err) => {
+    console.error("browser ws error", err);
+    try { upstream.close(1011, "client error"); } catch {}
   });
 });
 
 server.listen(PORT, () => {
   console.log(`voice backend listening on :${PORT}`);
+  console.log("Audio formats:", { INPUT_AUDIO_FORMAT, OUTPUT_AUDIO_FORMAT });
 });
-
-// ---------- utils ----------
-function safeSend(ws: WebSocket, obj: unknown) {
-  if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
-}
-function randomId(prefix = ""): string {
-  return `${prefix}${Math.random().toString(36).slice(2, 10)}`;
-}
