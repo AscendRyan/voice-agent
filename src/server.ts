@@ -9,7 +9,8 @@ const PORT = Number(process.env.PORT || 8787);
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY!;
 const MODEL = process.env.OPENAI_REALTIME_MODEL || "gpt-realtime";
 const VOICE = process.env.VOICE || "alloy";
-const OUTPUT_AUDIO_FORMAT = process.env.OUTPUT_AUDIO_FORMAT || "opus";
+const OUTPUT_AUDIO_FORMAT = process.env.OUTPUT_AUDIO_FORMAT || "pcm16";
+const INPUT_AUDIO_FORMAT  = process.env.INPUT_AUDIO_FORMAT  || "pcm16";
 
 if (!OPENAI_API_KEY) {
   console.error("Missing OPENAI_API_KEY in env");
@@ -205,3 +206,4 @@ function safeSend(ws: WebSocket, obj: unknown) {
 function randomId(prefix = ""): string {
   return `${prefix}${Math.random().toString(36).slice(2, 10)}`;
 }
+
