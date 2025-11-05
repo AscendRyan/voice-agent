@@ -11,10 +11,12 @@ import { gmailRead, gmailSearch, gmailSend } from "./gmail.js";
 ==================================*/
 const PORT = Number(process.env.PORT || 10000);
 
-// Deepgram STT (Realtime) and TTS (WS)
+// Deepgram STT & TTS
 const DG_API_KEY = mustEnv("DEEPGRAM_API_KEY");
 const DG_STT_MODEL = process.env.DEEPGRAM_STT_MODEL || "nova-2";
 const DG_STT_SR = num(process.env.DEEPGRAM_STT_SAMPLE_RATE, 16000);
+
+// Aura voices like "aura-asteria" or "aura-asteria-en"
 const DG_TTS_VOICE = process.env.DEEPGRAM_TTS_VOICE || "aura-asteria";
 const DG_TTS_SR = num(process.env.DEEPGRAM_TTS_SAMPLE_RATE, 16000);
 
@@ -25,7 +27,7 @@ const SYSTEM_PROMPT =
   process.env.AGENT_SYSTEM_PROMPT ||
   "You are a concise, helpful voice assistant for natural phone-like conversations. Prefer short answers unless asked for detail. If tools can help, call them.";
 
-// Partial → final timeout (if no STT 'final' arrives)
+// If STT never sends a final, upgrade latest partial to final after this silence
 const PARTIAL_TIMEOUT_MS = num(process.env.PARTIAL_TIMEOUT_MS, 800);
 
 /* ================================
@@ -87,16 +89,16 @@ wss.on("connection", (ws: WebSocket, req) => {
     // partial buffer
     latestPartial: "" as string,
     partialTimer: null as NodeJS.Timeout | null,
-    // convo
+    // conversation
     messages: [{ role: "system", content: SYSTEM_PROMPT }] as MistralMessage[],
   };
 
   sendJson(ws, { type: "ready", sessionId });
 
+  /* =============== STT (Deepgram Realtime) =============== */
   function ensureStt() {
     if (state.sttWs) return;
 
-    // Ask Deepgram to give us utterance end events; still handle silence fallback.
     const url =
       `wss://api.deepgram.com/v1/listen` +
       `?model=${encodeURIComponent(DG_STT_MODEL)}` +
@@ -117,7 +119,7 @@ wss.on("connection", (ws: WebSocket, req) => {
     });
 
     dg.on("message", async (data: Buffer) => {
-      // Deepgram sends JSON control + binary audio back for echo cancellation sometimes. We care about JSON transcripts.
+      // Deepgram sends JSON results; we ignore any non-JSON frames here
       let msg: any = null;
       try {
         msg = JSON.parse(data.toString());
@@ -125,17 +127,16 @@ wss.on("connection", (ws: WebSocket, req) => {
         return;
       }
 
-      // Try to read transcript & final-ish markers
       const alt = msg?.channel?.alternatives?.[0];
       const transcript: string | undefined = alt?.transcript;
       const isFinal: boolean =
         msg?.is_final === true ||
         msg?.type === "UtteranceEnd" ||
-        msg?.type === "Results" && msg?.speech_final === true;
+        (msg?.type === "Results" && msg?.speech_final === true);
 
       if (transcript && transcript.trim()) {
         state.latestPartial = transcript.trim();
-        // forward partials to the browser (handy for a live caption)
+        // forward partials to the browser (for live captions)
         sendJson(ws, {
           type: "stt.partial",
           transcript: state.latestPartial,
@@ -176,10 +177,13 @@ wss.on("connection", (ws: WebSocket, req) => {
     await handleUserTurn(text);
   }
 
+  /* =============== TTS (Deepgram Aura over WS) =============== */
   async function speak(text: string) {
     // stop previous TTS if any
     if (state.ttsWs) {
-      try { state.ttsWs.close(); } catch {}
+      try {
+        state.ttsWs.close();
+      } catch {}
       state.ttsWs = null;
     }
     state.speaking = true;
@@ -197,33 +201,43 @@ wss.on("connection", (ws: WebSocket, req) => {
     state.ttsWs = dgTts;
 
     dgTts.on("open", () => {
-      console.log("[TTS] start");
-      dgTts.send(JSON.stringify({ type: "text", text }));
-      dgTts.send(JSON.stringify({ type: "flush" }));
+      console.log("[TTS] websocket opened -> sending Speak + Flush");
+      try {
+        // Deepgram expects capitalized message types
+        dgTts.send(JSON.stringify({ type: "Speak", text }));
+        dgTts.send(JSON.stringify({ type: "Flush" }));
+      } catch (err) {
+        console.error("[TTS] send error", err);
+      }
     });
 
     dgTts.on("message", (data: Buffer, isBinary: boolean) => {
       if (isBinary) {
+        // Forward audio to the browser as base64 PCM16 chunks
         const b64 = data.toString("base64");
         sendJson(ws, { type: "response.audio.delta", delta: b64 });
       } else {
-        // non-binary status messages can be ignored
+        // Useful control/debug frames
+        const msg = data.toString();
+        console.log("[TTS] text frame:", msg);
+        sendJson(ws, { type: "debug", source: "tts", message: msg });
       }
     });
 
-    dgTts.on("close", () => {
-      console.log("[TTS] done");
+    dgTts.on("error", (e) => {
+      console.error("[TTS] error", e?.toString?.() || e);
       state.speaking = false;
       sendJson(ws, { type: "response.audio.done" });
     });
 
-    dgTts.on("error", (e) => {
-      console.log("[TTS] error", e?.toString?.() || e);
+    dgTts.on("close", (code, reason) => {
+      console.log("[TTS] closed", code, reason.toString());
       state.speaking = false;
       sendJson(ws, { type: "response.audio.done" });
     });
   }
 
+  /* =============== LLM + Tools (Mistral) =============== */
   async function handleUserTurn(userText: string) {
     if (!userText) return;
     console.log(`[LLM] user: ${userText}`);
@@ -373,11 +387,12 @@ wss.on("connection", (ws: WebSocket, req) => {
     }
   }
 
+  /* =============== WS from browser =============== */
   ws.on("message", async (data: Buffer, isBinary: boolean) => {
     if (state.closed) return;
 
     if (isBinary) {
-      // Incoming mic frames
+      // Incoming mic frames (PCM16). Ensure STT and forward the bytes.
       ensureStt();
       if (state.sttWs?.readyState === WebSocket.OPEN) {
         state.sttWs.send(data);
@@ -410,10 +425,12 @@ wss.on("connection", (ws: WebSocket, req) => {
       case "interrupt": {
         console.log("[INTERRUPT] stop speaking if any");
         if (state.ttsWs && state.ttsWs.readyState === WebSocket.OPEN) {
-          try { state.ttsWs.close(); } catch {}
-          state.ttsWs = null;
-          state.speaking = false;
+          try {
+            state.ttsWs.close();
+          } catch {}
         }
+        state.ttsWs = null;
+        state.speaking = false;
         return;
       }
 
@@ -443,10 +460,16 @@ wss.on("connection", (ws: WebSocket, req) => {
    Helpers
 ==================================*/
 function sendJson(ws: WebSocket, obj: unknown) {
-  try { ws.send(JSON.stringify(obj)); } catch {}
+  try {
+    ws.send(JSON.stringify(obj));
+  } catch {}
 }
 function safeJson(s: string) {
-  try { return JSON.parse(s); } catch { return {}; }
+  try {
+    return JSON.parse(s);
+  } catch {
+    return {};
+  }
 }
 function mustEnv(name: string): string {
   const v = process.env[name];
