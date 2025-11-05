@@ -1,317 +1,359 @@
-// src/server.ts
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
-import http from "http";
-import WebSocket, { WebSocketServer } from "ws";
-import {
-  getAuthUrl,
-  handleOAuthCallback,
-  hasRefreshToken,
-  gmailSearch,
-  gmailRead
-} from "./google.js";
+import { WebSocketServer, WebSocket } from "ws";
+import fetch from "node-fetch";
+import { v4 as uuid } from "uuid";
+import { gmailRead, gmailSearch, gmailSend } from "./gmail.js";
 
+// -------------------------
+// config / constants
+// -------------------------
 const PORT = Number(process.env.PORT || 10000);
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
-if (!OPENAI_API_KEY) {
-  console.error("Missing OPENAI_API_KEY");
-  process.exit(1);
+
+// Deepgram STT
+const DG_API_KEY = process.env.DEEPGRAM_API_KEY!;
+const DG_STT_MODEL = process.env.DEEPGRAM_STT_MODEL || "nova-2";
+const DG_STT_SR = Number(process.env.DEEPGRAM_STT_SAMPLE_RATE || 16000);
+
+// Deepgram TTS
+const DG_TTS_VOICE = process.env.DEEPGRAM_TTS_VOICE || "aura-asteria";
+const DG_TTS_SR = Number(process.env.DEEPGRAM_TTS_SAMPLE_RATE || 16000);
+
+// Mistral
+const MISTRAL_KEY = process.env.MISTRAL_API_KEY!;
+const MISTRAL_MODEL = process.env.MISTRAL_MODEL || "mistral-large-latest";
+const SYSTEM_PROMPT = process.env.AGENT_SYSTEM_PROMPT || "You are a concise, helpful voice assistant.";
+
+// Minimal validation
+for (const [name, v] of Object.entries({
+  DEEPGRAM_API_KEY: DG_API_KEY,
+  MISTRAL_API_KEY: MISTRAL_KEY,
+})) {
+  if (!v) throw new Error(`Missing env: ${name}`);
 }
 
-// ===== Basic HTTP app (health + OAuth) =====
+// -------------------------
+// express
+// -------------------------
 const app = express();
 app.use(cors());
-app.get("/", (_req, res) => res.send("voice backend ok"));
-app.get("/status", (_req, res) => {
-  res.json({
-    ok: true,
-    gmail_connected: hasRefreshToken(),
-    model: process.env.REALTIME_MODEL || "gpt-realtime",
-    tools_enabled: (process.env.ENABLE_TOOLS || "true") === "true"
-  });
+app.get("/", (_, res) => res.send("OK"));
+app.get("/health", (_, res) => res.json({ ok: true }));
+
+// -------------------------
+// WebSocket server
+// -------------------------
+const server = app.listen(PORT, () => {
+  console.log(`voice backend listening on :${PORT}`);
 });
-
-// Step 1: start Google OAuth (click this in the browser)
-app.get("/auth/google", (_req, res) => {
-  try {
-    const url = getAuthUrl();
-    res.redirect(url);
-  } catch (e: any) {
-    res.status(500).send(`OAuth not configured. ${e?.message || e}`);
-  }
-});
-
-// Step 2: Google redirects here with ?code=...
-app.get("/oauth2/callback", async (req, res) => {
-  const code = String(req.query.code || "");
-  if (!code) return res.status(400).send("Missing ?code");
-  try {
-    const { refreshToken } = await handleOAuthCallback(code);
-    const html = `
-      <h2>Gmail connected!</h2>
-      ${refreshToken ? `<p><b>Refresh token:</b> <code>${refreshToken}</code></p>` : "<p>(Refresh token already set.)</p>"}
-      <p>Next step:</p>
-      <ol>
-        <li>In Render &rarr; your service &rarr; <b>Environment</b>, add <code>GMAIL_REFRESH_TOKEN</code> = the value above.</li>
-        <li>Save, then <b>Deploy</b> (so it persists across restarts).</li>
-      </ol>
-      <p>Now the assistant can use Gmail tools.</p>
-    `;
-    res.send(html);
-  } catch (e: any) {
-    res.status(500).send(`OAuth exchange failed: ${e?.message || e}`);
-  }
-});
-
-const server = http.createServer(app);
-
-// ===== WebSocket bridge for /ws/voice =====
 const wss = new WebSocketServer({ server, path: "/ws/voice" });
 
-type PendingCall = { name?: string; args: string };
-const TOOL_DEFS =
-  (process.env.ENABLE_TOOLS || "true") === "true"
-    ? [
-        {
-          type: "function",
+// A very small “protocol” we keep compatible with your frontend:
+// - send {type:"ready", sessionId}
+// - accept binary PCM16 frames from browser mic
+// - accept JSON control messages: session.update, response.create, interrupt
+// - send out TTS audio as {type:"response.audio.delta", delta: base64PCM16}
+// - send final markers & transcripts similar to OpenAI Realtime
+
+wss.on("connection", (ws: WebSocket) => {
+  const sessionId = `sess_${uuid().slice(0, 10)}`;
+
+  // Per-connection state
+  const state = {
+    sttWs: null as WebSocket | null,
+    ttsWs: null as WebSocket | null,
+    speaking: false,
+    closed: false,
+    // last “final” transcript to feed the LLM
+    bufferTranscript: "",
+    // simple conversation memory (last few turns)
+    messages: [
+      { role: "system", content: SYSTEM_PROMPT },
+    ] as Array<{role: "system"|"user"|"assistant"|"tool", content: string; name?: string}>
+  };
+
+  // Send ready
+  sendJson(ws, { type: "ready", sessionId });
+
+  // Start STT pipe to Deepgram once we receive the first audio or session.update
+  function ensureStt() {
+    if (state.sttWs) return;
+    const url = `wss://api.deepgram.com/v1/listen?model=${encodeURIComponent(DG_STT_MODEL)}&encoding=linear16&sample_rate=${DG_STT_SR}&punctuate=true&smart_format=true&vad_turnoff=true&endpointing=true&multichannel=false`;
+    const dg = new WebSocket(url, { headers: { Authorization: `Token ${DG_API_KEY}` } });
+    state.sttWs = dg;
+
+    dg.on("open", () => {
+      // nothing: config came via query
+    });
+
+    dg.on("message", async (data: Buffer) => {
+      // Deepgram sends JSON events for transcripts
+      try {
+        const msg = JSON.parse(data.toString());
+        // Look for "is_final" transcripts
+        const alt = msg?.channel?.alternatives?.[0];
+        const transcript: string | undefined = alt?.transcript;
+        const isFinal: boolean = msg?.is_final === true || msg?.type === "UtteranceEnd";
+        if (transcript && transcript.trim()) {
+          // Live partials → could send to UI as captions if you want
+          sendJson(ws, { type: "response.audio_transcript.delta", transcript });
+        }
+        if (transcript && isFinal) {
+          state.bufferTranscript = transcript.trim();
+          // Run agent turn
+          await handleUserTurn(state.bufferTranscript);
+          state.bufferTranscript = "";
+        }
+      } catch {
+        // ignore non-JSON (DG may send pings)
+      }
+    });
+
+    dg.on("close", () => { state.sttWs = null; });
+    dg.on("error", () => { /* swallow */ });
+  }
+
+  // Convert LLM reply to TTS (Deepgram WebSocket TTS) and stream to browser
+  async function speak(text: string) {
+    if (state.ttsWs) {
+      try { state.ttsWs.close(); } catch {}
+      state.ttsWs = null;
+    }
+    state.speaking = true;
+
+    // See Deepgram TTS WebSocket docs (Aura WS streaming). We’ll send config and stream the text.
+    // Returns BINARY audio frames we forward as base64 PCM16 to the frontend.
+    // Docs: Realtime TTS over WS & examples. :contentReference[oaicite:4]{index=4}
+    const url = `wss://api.deepgram.com/v1/speak?model=${encodeURIComponent(DG_TTS_VOICE)}&encoding=linear16&sample_rate=${DG_TTS_SR}`;
+    const dgTts = new WebSocket(url, { headers: { Authorization: `Token ${DG_API_KEY}` } });
+    state.ttsWs = dgTts;
+
+    dgTts.on("open", () => {
+      // Send the text chunk; you can also chunk long text for lower latency. :contentReference[oaicite:5]{index=5}
+      dgTts.send(JSON.stringify({ type: "text", text }));
+      // Signal done so DG can flush audio
+      dgTts.send(JSON.stringify({ type: "flush" }));
+    });
+
+    dgTts.on("message", (data: Buffer, isBinary: boolean) => {
+      // Deepgram sends both JSON and binary; forward only binary audio frames
+      if (isBinary) {
+        const b64 = data.toString("base64");
+        sendJson(ws, { type: "response.audio.delta", delta: b64 });
+      } else {
+        // JSON status/progress; ignore
+      }
+    });
+
+    dgTts.on("close", () => {
+      state.speaking = false;
+      sendJson(ws, { type: "response.audio.done" });
+    });
+
+    dgTts.on("error", () => {
+      state.speaking = false;
+      sendJson(ws, { type: "response.audio.done" });
+    });
+  }
+
+  async function handleUserTurn(userText: string) {
+    if (!userText) return;
+    state.messages.push({ role: "user", content: userText });
+
+    const { answer, toolEvents } = await callMistralWithTools(state.messages);
+
+    // If the model asked to use tools, we already executed them in callMistralWithTools.
+    // Now speak the final answer.
+    state.messages.push({ role: "assistant", content: answer });
+    sendJson(ws, { type: "response.audio_transcript.delta", transcript: answer });
+    await speak(answer);
+
+    // Finish markers for the UI (keeps it familiar)
+    sendJson(ws, { type: "response.audio_transcript.done" });
+    sendJson(ws, { type: "response.done" });
+  }
+
+  // Minimal tool loop with Mistral function calling
+  async function callMistralWithTools(history: Array<{role:string; content:string; name?: string}>) {
+    // Prepare tool specs (JSON schema) for Mistral :contentReference[oaicite:6]{index=6}
+    const tools = [
+      {
+        type: "function",
+        function: {
           name: "gmail_search",
-          description:
-            "Search the user's Gmail. Return up to maxResults messages with id, from, subject, date, snippet. Use Gmail search syntax like `in:inbox newer_than:7d`.",
+          description: "Search Gmail with a query (e.g., from:, subject:, newer_than:7d). Returns up to 5 message ids with headers.",
           parameters: {
             type: "object",
             properties: {
               query: { type: "string", description: "Gmail search query" },
-              maxResults: {
-                type: "integer",
-                minimum: 1,
-                maximum: 10,
-                default: 5
-              }
+              maxResults: { type: "integer", minimum: 1, maximum: 20, default: 5 }
             },
             required: ["query"]
           }
-        },
-        {
-          type: "function",
+        }
+      },
+      {
+        type: "function",
+        function: {
           name: "gmail_read",
-          description:
-            "Read a Gmail message by id (from gmail_search). Return subject, from, date, snippet, and body_text (plain text only).",
+          description: "Read a Gmail message by id; returns headers and plain text body.",
+          parameters: { type: "object", properties: { id: { type: "string" } }, required: ["id"] }
+        }
+      },
+      {
+        type: "function",
+        function: {
+          name: "gmail_send",
+          description: "Send an email via Gmail.",
           parameters: {
             type: "object",
             properties: {
-              id: { type: "string", description: "Gmail message id" }
+              to: { type: "string" },
+              subject: { type: "string" },
+              body: { type: "string" }
             },
-            required: ["id"]
+            required: ["to", "subject", "body"]
           }
         }
-      ]
-    : [];
-
-function sessionInstructions(): string {
-  const base =
-    process.env.DEFAULT_INSTRUCTIONS ||
-    "You are a concise, helpful voice assistant. Speak in short UK English sentences. If a tool is useful, call it.";
-  const toolHint = hasRefreshToken()
-    ? "You can call gmail_search and gmail_read to help with emails."
-    : "If asked to use Gmail, say Gmail is not connected and ask the user to link it.";
-  return `${base} ${toolHint}`;
-}
-
-function connectToOpenAI(): WebSocket {
-  const model = process.env.REALTIME_MODEL || "gpt-realtime";
-  const url = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(model)}`;
-  const ws = new WebSocket(url, {
-    headers: {
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
-      "OpenAI-Beta": "realtime=v1"
-    }
-  });
-  return ws;
-}
-
-wss.on("connection", (client) => {
-  // Connect to OpenAI Realtime as soon as a browser connects to us.
-  const openai = connectToOpenAI();
-
-  // Buffer client messages until OpenAI socket is open
-  const clientQueue: Array<Buffer | string> = [];
-  let openaiReady = false;
-
-  // Track function calls
-  const pending: Record<string, PendingCall> = {};
-
-  function sendToOpenAI(obj: any) {
-    const raw = JSON.stringify(obj);
-    if (openaiReady) openai.send(raw);
-    else clientQueue.push(raw);
-  }
-
-  function forwardToClient(obj: any) {
-    try {
-      client.send(JSON.stringify(obj));
-    } catch {}
-  }
-
-  openai.on("open", () => {
-    openaiReady = true;
-
-    // Configure the Realtime session
-    sendToOpenAI({
-      type: "session.update",
-      session: {
-        instructions: sessionInstructions(),
-        voice: process.env.REALTIME_VOICE || "alloy",
-        input_audio_format: "pcm16",
-        output_audio_format: "pcm16",
-        turn_detection: {
-          type: "server_vad",
-          threshold: 0.5,
-          prefix_padding_ms: 300,
-          silence_duration_ms: Number(process.env.TURN_SILENCE_MS || 500),
-          create_response: true,
-          interrupt_response: true
-        },
-        temperature: Number(process.env.SESSION_TEMPERATURE || 0.8),
-        tools: TOOL_DEFS,
-        tool_choice: "auto",
-        max_response_output_tokens: "inf"
       }
+    ];
+
+    // Mistral messages are OpenAI-like
+    const mistralMessages = history.map(m => {
+      if (m.role === "tool") {
+        return { role: "tool", name: m.name, content: m.content };
+      }
+      return { role: m.role as "system"|"user"|"assistant", content: m.content };
     });
 
-    // flush anything client sent while we were connecting
-    for (const item of clientQueue) openai.send(item);
-    clientQueue.length = 0;
-  });
+    // 1st call: let the model decide to use a tool or answer
+    const first = await fetch("https://api.mistral.ai/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${MISTRAL_KEY}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        model: MISTRAL_MODEL,
+        messages: mistralMessages,
+        tools,
+        tool_choice: "auto",
+        temperature: 0.6,
+        stream: false
+      })
+    }).then(r => r.json());
 
-  // ===== Browser -> Backend (binary audio or JSON control) =====
-  client.on("message", (data: Buffer, isBinary) => {
+    // If there are tool calls, execute them and do a second call with tool results
+    const toolCalls = first?.choices?.[0]?.message?.tool_calls || [];
+    const toolEvents: string[] = [];
+
+    if (Array.isArray(toolCalls) && toolCalls.length) {
+      for (const call of toolCalls) {
+        const toolName = call.function?.name;
+        const args = safeJson(call.function?.arguments || "{}");
+        let result: any = { ok: false, note: "no result" };
+        try {
+          if (toolName === "gmail_search") result = await gmailSearch(args.query, args.maxResults);
+          else if (toolName === "gmail_read") result = await gmailRead(args.id);
+          else if (toolName === "gmail_send") result = await gmailSend(args.to, args.subject, args.body);
+          toolEvents.push(`${toolName} ✓`);
+        } catch (e: any) {
+          result = { ok: false, error: String(e?.message || e) };
+          toolEvents.push(`${toolName} ✗`);
+        }
+        // push tool result back to conversation
+        state.messages.push({ role: "tool", name: toolName, content: JSON.stringify(result) });
+      }
+
+      const second = await fetch("https://api.mistral.ai/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${MISTRAL_KEY}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          model: MISTRAL_MODEL,
+          messages: state.messages.map(m => {
+            if (m.role === "tool") return { role: "tool", name: m.name, content: m.content };
+            return { role: m.role, content: m.content };
+          }),
+          temperature: 0.6,
+          stream: false
+        })
+      }).then(r => r.json());
+
+      const finalAnswer = second?.choices?.[0]?.message?.content || "Done.";
+      return { answer: String(finalAnswer), toolEvents };
+    } else {
+      // No tool use, just answer
+      const finalAnswer = first?.choices?.[0]?.message?.content || "Okay.";
+      return { answer: String(finalAnswer), toolEvents };
+    }
+  }
+
+  // Incoming messages from the browser
+  ws.on("message", async (data: Buffer, isBinary: boolean) => {
+    if (state.closed) return;
+
     if (isBinary) {
-      // raw PCM16 -> forward straight through
-      if (openaiReady) openai.send(data);
-      else clientQueue.push(data);
+      ensureStt();
+      // forward raw PCM16 to Deepgram STT
+      state.sttWs?.readyState === WebSocket.OPEN && state.sttWs.send(data);
       return;
     }
 
-    // JSON control messages from the frontend
-    let msg: any;
-    try {
-      msg = JSON.parse(data.toString("utf8"));
-    } catch {
-      return;
-    }
+    // JSON control
+    let msg: any = null;
+    try { msg = JSON.parse(data.toString()); } catch { /* ignore */ }
 
-    // Interrupts from frontend map to response.cancel
-    if (msg?.type === "interrupt") {
-      sendToOpenAI({ type: "response.cancel" });
-      return;
-    }
+    if (!msg || typeof msg.type !== "string") return;
 
-    // Pass-through any other client events (e.g. response.create test)
-    sendToOpenAI(msg);
+    switch (msg.type) {
+      case "session.update": {
+        // Confirm back (format is already PCM16)
+        sendJson(ws, {
+          type: "session.updated",
+          session: {
+            instructions: SYSTEM_PROMPT,
+            input_audio_format: "pcm16",
+            output_audio_format: "pcm16"
+          }
+        });
+        return;
+      }
+      case "interrupt": {
+        // Stop any speaking
+        if (state.ttsWs && state.ttsWs.readyState === WebSocket.OPEN) {
+          try { state.ttsWs.close(); } catch {}
+          state.ttsWs = null;
+          state.speaking = false;
+        }
+        return;
+      }
+      case "response.create": {
+        // Test Hello path: just speak the provided text
+        const text = msg?.response?.instructions || "Hello!";
+        sendJson(ws, { type: "response.created" });
+        await speak(String(text));
+        return;
+      }
+      default:
+        return;
+    }
   });
 
-  // ===== OpenAI -> Backend =====
-  openai.on("message", async (chunk) => {
-    let evt: any;
-    try {
-      evt = JSON.parse(chunk.toString("utf8"));
-    } catch {
-      // Some server frames can be binary; forward to client as-is
-      try {
-        client.send(chunk);
-      } catch {}
-      return;
-    }
-
-    // ---- Tool calling handling (server side) ----
-    // 1) Model declares a function call
-    if (evt?.type === "response.function_call.created") {
-      pending[evt.call_id] = { name: evt.name, args: "" };
-      return;
-    }
-
-    // 2) Arguments stream in
-    if (evt?.type === "response.function_call_arguments.delta") {
-      const p = pending[evt.call_id] || { args: "" };
-      p.args += evt.delta || "";
-      pending[evt.call_id] = p;
-      return;
-    }
-
-    // 3) Arguments finished -> execute tool
-    if (evt?.type === "response.function_call_arguments.done") {
-      const p = pending[evt.call_id];
-      let args: any = {};
-      try {
-        args = p?.args ? JSON.parse(p.args) : {};
-      } catch {
-        args = {};
-      }
-
-      let output: any = { ok: false, error: "Unknown tool" };
-      try {
-        if (p?.name === "gmail_search") {
-          output = await gmailSearch({ query: String(args.query || ""), maxResults: args.maxResults });
-        } else if (p?.name === "gmail_read") {
-          output = await gmailRead({ id: String(args.id || "") });
-        } else {
-          output = { ok: false, error: `Tool ${p?.name} not implemented.` };
-        }
-      } catch (e: any) {
-        output = { ok: false, error: e?.message || String(e) };
-      }
-
-      // 4) Send function_call_output back to OpenAI
-      sendToOpenAI({
-        type: "conversation.item.create",
-        item: {
-          type: "function_call_output",
-          call_id: evt.call_id,
-          output: JSON.stringify(output)
-        }
-      });
-
-      // 5) Ask the model to continue, using the tool result
-      sendToOpenAI({
-        type: "response.create",
-        response: {
-          instructions:
-            "Use the tool output to answer the user. If you looked at emails, summarise clearly and ask if they want to read any.",
-          modalities: ["audio", "text"]
-        }
-      });
-
-      return;
-    }
-
-    // For all other events (audio deltas, transcripts, ready, etc.) just forward to browser
-    forwardToClient(evt);
+  ws.on("close", () => {
+    state.closed = true;
+    try { state.sttWs?.close(); } catch {}
+    try { state.ttsWs?.close(); } catch {}
   });
-
-  // Propagate close/error both ways
-  const safeClose = () => {
-    try {
-      if (openai.readyState === WebSocket.OPEN || openai.readyState === WebSocket.CONNECTING) {
-        openai.close();
-      }
-    } catch {}
-    try {
-      if (client.readyState === WebSocket.OPEN) client.close();
-    } catch {}
-  };
-
-  client.on("close", safeClose);
-  client.on("error", safeClose);
-  openai.on("close", () => {
-    try {
-      client.send(JSON.stringify({ type: "closed" }));
-    } catch {}
-    safeClose();
-  });
-  openai.on("error", safeClose);
 });
 
-server.listen(PORT, () => {
-  console.log(`voice backend listening on :${PORT}`);
-});
+function sendJson(ws: WebSocket, obj: unknown) {
+  try { ws.send(JSON.stringify(obj)); } catch {}
+}
+
+function safeJson(s: string) {
+  try { return JSON.parse(s); } catch { return {}; }
+}
